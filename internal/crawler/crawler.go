@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -57,13 +58,6 @@ func New(cfg *Config, logger zerolog.Logger, store storage.Storage) (*Crawler, e
 // Crawl iterates through every project in the given GitLab host
 // and parses the CI file, and it's includes into the given Neo4j instance
 func (c *Crawler) Crawl(ctx context.Context) error {
-	if c.config.StorageCleanup {
-		c.logger.Info().Msg("Cleanup storage...")
-		err := c.storage.RemoveAll(ctx)
-		if err != nil {
-			return err
-		}
-	}
 
 	c.logger.Info().Msg("Starting to crawl...")
 	resultChan := make(chan gitlab.Project, 200)
@@ -81,18 +75,13 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 		streamOK = true
 	}()
 
-	for p := range resultChan {
-		_, exists := c.projectSet[p.PathWithNamespace]
-		if exists {
-			continue
-		}
-
-		if err := c.updateProjectInGraph(ctx, p); err != nil {
-			c.logger.Err(err).
-				Str("ProjectPath", p.PathWithNamespace).
-				Int("ProjectID", p.ID).
-				Msg("failed to parse project")
-		}
+	dependencyProjects := make(chan string, 100)
+	for i := 0; i < 30; i++ {
+		go c.worker(ctx, resultChan, dependencyProjects)
+	}
+	err := c.writeDependenciesToFile(dependencyProjects)
+	if err != nil {
+		return err
 	}
 
 	if !streamOK {
@@ -103,25 +92,50 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 	return nil
 }
 
-func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Project) error {
+func (c *Crawler) worker(ctx context.Context, projects chan gitlab.Project, dependencyProjects chan string) {
+	for p := range projects {
+
+		c.projectSetMut.Lock()
+		_, exists := c.projectSet[p.PathWithNamespace]
+		if exists {
+			c.projectSetMut.Unlock()
+			continue
+		}
+		c.projectSet[p.PathWithNamespace] = struct{}{}
+		c.projectSetMut.Unlock()
+
+		if err := c.updateProjectInGraph(ctx, p, dependencyProjects); err != nil {
+			c.logger.Err(err).
+				Str("ProjectPath", p.PathWithNamespace).
+				Int("ProjectID", p.ID).
+				Msg("failed to parse project")
+		}
+	}
+
+}
+
+func (c *Crawler) writeDependenciesToFile(dependencyProjects chan string) error {
+
+	filename := "/Users/fdelgado2/dependency-projects-2"
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return errors.New("could not open file " + filename)
+	}
+	defer f.Close()
+
+	for p := range dependencyProjects {
+		if _, err = f.WriteString(p + "\n"); err != nil {
+			return errors.New("could not append to file")
+		}
+	}
+	return nil
+}
+
+func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Project, dependencyProjects chan string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		c.projectSetMut.RLock()
-		_, exists := c.projectSet[project.PathWithNamespace]
-		if exists {
-			c.projectSetMut.RUnlock()
-			return nil
-		}
-		c.projectSetMut.RUnlock()
-		c.projectSetMut.Lock()
-		c.projectSet[project.PathWithNamespace] = struct{}{}
-		c.projectSetMut.Unlock()
-
-		if err := c.storage.CreateProjectNode(ctx, project.PathWithNamespace); err != nil {
-			return fmt.Errorf("failed to write project to neo4j: %w", err)
-		}
 
 		if len(project.DefaultBranch) == 0 {
 			c.logger.Debug().
@@ -131,7 +145,7 @@ func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Proje
 			return nil
 		}
 
-		err := c.handleIncludes(ctx, project, gitlabCIFileName)
+		err := c.handleIncludes(ctx, project, dependencyProjects, gitlabCIFileName)
 		if err != nil {
 			c.logger.Error().
 				Err(err).
@@ -142,7 +156,7 @@ func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Proje
 	}
 }
 
-func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, filePath string) error {
+func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, dependencyProjects chan string, filePath string) error {
 	gitlabCIFile, err := c.gitlabClient.GetRawFileFromProject(ctx, project.ID, filePath, project.DefaultBranch)
 	if err != nil {
 		if errors.Is(err, gitlab.ErrRawFileNotFound) {
@@ -165,50 +179,8 @@ func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, fi
 				Str("Files", strings.Join(i.Files, ",")).
 				Msg("Got empty ref")
 		}
-
-		if err = c.traverseIncludes(ctx, project.PathWithNamespace, i); err != nil {
-			c.logger.Err(err).
-				Str("Project", i.Project).
-				Msg("failed to parse include")
-		}
-
-		p, err := c.gitlabClient.GetProjectFromPath(ctx, i.Project)
-		if err != nil {
-			return err
-		}
-
-		for _, f := range i.Files {
-			err = c.handleIncludes(ctx, p, f)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (c *Crawler) traverseIncludes(ctx context.Context, parentName string, include RemoteInclude) error {
-	c.projectSetMut.Lock()
-	c.projectSet[include.Project] = struct{}{}
-	c.projectSetMut.Unlock()
-
-	if err := c.storage.CreateProjectNode(ctx, include.Project); err != nil {
-		return fmt.Errorf("failed to write project to neo4j: %w", err)
-	}
-
-	if err := c.storage.CreateIncludeEdge(ctx, storage.IncludeEdge{
-		SourceProject: parentName,
-		TargetProject: include.Project,
-		Ref:           include.Ref,
-		Files:         include.Files,
-	}); err != nil {
-		return fmt.Errorf("failed to write neo4j transaction: %w", err)
-	}
-
-	for _, ci := range include.Children {
-		if err := c.traverseIncludes(ctx, ci.Project, ci); err != nil {
-			return fmt.Errorf("failed to write child includes for %s: %w", ci.Project, err)
+		if i.Project != "" {
+			dependencyProjects <- i.Project
 		}
 	}
 
