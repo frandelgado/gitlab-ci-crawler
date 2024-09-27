@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -23,17 +21,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/auth"
-	iauth "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/auth"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
-	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"net"
 	"reflect"
 	"time"
 
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/auth"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db"
+	iauth "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/auth"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
+	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/packstream"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/telemetry"
+	itime "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/time"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 )
 
@@ -112,18 +112,16 @@ type bolt4 struct {
 	authManager   auth.TokenManager
 	resetAuth     bool
 	errorListener ConnectionErrorListener
-	now           *func() time.Time
 }
 
 func NewBolt4(
 	serverName string,
 	conn net.Conn,
 	errorListener ConnectionErrorListener,
-	timer *func() time.Time,
 	logger log.Logger,
 	boltLog log.BoltLogger,
 ) *bolt4 {
-	now := (*timer)()
+	now := itime.Now()
 	b := &bolt4{
 		state:         bolt4_unauthorized,
 		conn:          conn,
@@ -134,7 +132,6 @@ func NewBolt4(
 		streams:       openstreams{},
 		lastQid:       -1,
 		errorListener: errorListener,
-		now:           timer,
 	}
 	b.queue = newMessageQueue(
 		conn,
@@ -987,6 +984,10 @@ func (b *bolt4) GetCurrentAuth() (auth.TokenManager, iauth.Token) {
 	return b.authManager, token
 }
 
+func (b *bolt4) Telemetry(telemetry.API, func()) {
+	// TELEMETRY not support by this protocol version, so we ignore it.
+}
+
 func (b *bolt4) helloResponseHandler(checkUtcPatch bool) responseHandler {
 	return b.expectedSuccessHandler(b.onHelloSuccess(checkUtcPatch))
 }
@@ -1132,7 +1133,7 @@ func (b *bolt4) expectedSuccessHandler(onSuccess func(*success)) responseHandler
 }
 
 func (b *bolt4) onNextMessage() {
-	b.idleDate = (*b.now)()
+	b.idleDate = itime.Now()
 }
 
 func (b *bolt4) onFailure(ctx context.Context, failure *db.Neo4jError) {

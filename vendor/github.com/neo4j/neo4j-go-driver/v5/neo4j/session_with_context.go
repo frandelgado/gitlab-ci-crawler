@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -22,16 +20,16 @@ package neo4j
 import (
 	"context"
 	"fmt"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
-	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/pool"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/notifications"
 	"math"
 	"time"
 
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
+	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/retry"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/telemetry"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/notifications"
 )
 
 // TransactionWork represents a unit of work that will be executed against the provided
@@ -71,8 +69,8 @@ type SessionWithContext interface {
 	// Close closes any open resources and marks this session as unusable
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
 	Close(ctx context.Context) error
-	pipelinedRead(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
-	pipelinedWrite(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
+	executeQueryRead(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
+	executeQueryWrite(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
 	legacy() Session
 	getServerInfo(ctx context.Context) (ServerInfo, error)
 	verifyAuthentication(ctx context.Context) error
@@ -174,9 +172,6 @@ type SessionConfig struct {
 	//   - `neo4j.KerberosAuth`
 	//   - `neo4j.BearerAuth`
 	//   - `neo4j.CustomAuth`
-	//
-	// Session auth is part of the re-authentication preview feature
-	// (see README on what it means in terms of support and compatibility guarantees).
 	Auth *AuthToken
 
 	forceReAuth bool
@@ -190,10 +185,9 @@ const FetchDefault = 0
 
 // Connection pool as seen by the session.
 type sessionPool interface {
-	Borrow(ctx context.Context, getServerNames func() []string, wait bool, boltLogger log.BoltLogger, livenessCheckThreshold time.Duration, auth *idb.ReAuthToken) (idb.Connection, error)
+	Borrow(ctx context.Context, getServerNames func() []string, wait bool, boltLogger log.BoltLogger, livenessCheckTimeout time.Duration, auth *idb.ReAuthToken) (idb.Connection, error)
 	Return(ctx context.Context, c idb.Connection)
 	CleanUp(ctx context.Context)
-	Now() time.Time
 }
 
 type sessionWithContext struct {
@@ -206,7 +200,6 @@ type sessionWithContext struct {
 	explicitTx    *explicitTransaction
 	autocommitTx  *autocommitTransaction
 	sleep         func(d time.Duration)
-	now           *func() time.Time
 	logId         string
 	log           log.Logger
 	throttleTime  time.Duration
@@ -222,7 +215,6 @@ func newSessionWithContext(
 	pool sessionPool,
 	logger log.Logger,
 	token *idb.ReAuthToken,
-	now *func() time.Time,
 ) *sessionWithContext {
 	logId := log.NewId()
 	logger.Debugf(log.Session, logId, "Created")
@@ -241,7 +233,6 @@ func newSessionWithContext(
 		config:        sessConfig,
 		resolveHomeDb: sessConfig.DatabaseName == "",
 		sleep:         time.Sleep,
-		now:           now,
 		log:           logger,
 		logId:         logId,
 		throttleTime:  time.Second * 1,
@@ -306,9 +297,13 @@ func (s *sessionWithContext) BeginTransaction(ctx context.Context, configurers .
 	}
 
 	// Get a connection from the pool. This could fail in clustered environment.
-	conn, err := s.getConnection(ctx, s.defaultMode, pool.DefaultLivenessCheckThreshold)
+	conn, err := s.getConnection(ctx, s.defaultMode, s.driverConfig.ConnectionLivenessCheckTimeout)
 	if err != nil {
 		return nil, errorutil.WrapError(err)
+	}
+
+	if !s.driverConfig.TelemetryDisabled {
+		conn.Telemetry(telemetry.UnmanagedTransaction, nil)
 	}
 
 	beginBookmarks, err := s.getBookmarks(ctx)
@@ -334,22 +329,29 @@ func (s *sessionWithContext) BeginTransaction(ctx context.Context, configurers .
 	}
 
 	// Create transaction wrapper
-	s.explicitTx = &explicitTransaction{
+	txState := &transactionState{}
+	tx := &explicitTransaction{
 		conn:      conn,
 		fetchSize: s.fetchSize,
 		txHandle:  txHandle,
-		onClosed: func(tx *explicitTransaction) {
-			if tx.conn == nil {
-				return
-			}
-			// On run failure, transaction closed (rolled back or committed)
-			bookmarkErr := s.retrieveBookmarks(ctx, tx.conn, beginBookmarks)
-			s.pool.Return(ctx, tx.conn)
-			tx.err = errorutil.CombineAllErrors(tx.err, bookmarkErr)
-			tx.conn = nil
-			s.explicitTx = nil
-		},
+		txState:   txState,
 	}
+
+	onClose := func() {
+		if tx.conn == nil {
+			return
+		}
+		// On run failure, transaction closed (rolled back or committed)
+		bookmarkErr := s.retrieveBookmarks(ctx, tx.conn, beginBookmarks)
+		s.pool.Return(ctx, tx.conn)
+		tx.txState.err = errorutil.CombineAllErrors(tx.txState.err, bookmarkErr)
+		tx.conn = nil
+		s.explicitTx = nil
+	}
+	tx.onClosed = onClose
+	txState.resultErrorHandlers = append(txState.resultErrorHandlers, func(error) { onClose() })
+
+	s.explicitTx = tx
 
 	return s.explicitTx, nil
 }
@@ -357,25 +359,25 @@ func (s *sessionWithContext) BeginTransaction(ctx context.Context, configurers .
 func (s *sessionWithContext) ExecuteRead(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
-	return s.runRetriable(ctx, idb.ReadMode, work, true, configurers...)
+	return s.runRetriable(ctx, idb.ReadMode, work, true, telemetry.ManagedTransaction, configurers...)
 }
 
 func (s *sessionWithContext) ExecuteWrite(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
-	return s.runRetriable(ctx, idb.WriteMode, work, true, configurers...)
+	return s.runRetriable(ctx, idb.WriteMode, work, true, telemetry.ManagedTransaction, configurers...)
 }
 
-func (s *sessionWithContext) pipelinedRead(ctx context.Context,
+func (s *sessionWithContext) executeQueryRead(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
-	return s.runRetriable(ctx, idb.ReadMode, work, false, configurers...)
+	return s.runRetriable(ctx, idb.ReadMode, work, false, telemetry.ExecuteQuery, configurers...)
 }
 
-func (s *sessionWithContext) pipelinedWrite(ctx context.Context,
+func (s *sessionWithContext) executeQueryWrite(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
-	return s.runRetriable(ctx, idb.WriteMode, work, false, configurers...)
+	return s.runRetriable(ctx, idb.WriteMode, work, false, telemetry.ExecuteQuery, configurers...)
 }
 
 func (s *sessionWithContext) runRetriable(
@@ -383,6 +385,7 @@ func (s *sessionWithContext) runRetriable(
 	mode idb.AccessMode,
 	work ManagedTransactionWork,
 	blockingTxBegin bool,
+	api telemetry.API,
 	configurers ...func(*TransactionConfig)) (any, error) {
 
 	// Guard for more than one transaction per session
@@ -408,14 +411,13 @@ func (s *sessionWithContext) runRetriable(
 		Log:                     s.log,
 		LogName:                 log.Session,
 		LogId:                   s.logId,
-		Now:                     s.now,
 		Sleep:                   s.sleep,
 		Throttle:                retry.Throttler(s.throttleTime),
 		MaxDeadConnections:      s.driverConfig.MaxConnectionPoolSize,
 		DatabaseName:            s.config.DatabaseName,
 	}
 	for state.Continue() {
-		if hasCompleted, result := s.executeTransactionFunction(ctx, mode, config, &state, work, blockingTxBegin); hasCompleted {
+		if hasCompleted, result := s.executeTransactionFunction(ctx, mode, config, &state, work, blockingTxBegin, api); hasCompleted {
 			return result, nil
 		}
 	}
@@ -431,12 +433,19 @@ func (s *sessionWithContext) executeTransactionFunction(
 	config TransactionConfig,
 	state *retry.State,
 	work ManagedTransactionWork,
-	blockingTxBegin bool) (bool, any) {
+	blockingTxBegin bool,
+	api telemetry.API) (bool, any) {
 
-	conn, err := s.getConnection(ctx, mode, pool.DefaultLivenessCheckThreshold)
+	conn, err := s.getConnection(ctx, mode, s.driverConfig.ConnectionLivenessCheckTimeout)
 	if err != nil {
 		state.OnFailure(ctx, err, conn, false)
 		return false, nil
+	}
+
+	if !s.driverConfig.TelemetryDisabled && !state.TelemetrySent {
+		conn.Telemetry(api, func() {
+			state.TelemetrySent = true
+		})
 	}
 
 	// handle transaction function panic as well
@@ -467,7 +476,7 @@ func (s *sessionWithContext) executeTransactionFunction(
 		return false, nil
 	}
 
-	tx := managedTransaction{conn: conn, fetchSize: s.fetchSize, txHandle: txHandle}
+	tx := managedTransaction{conn: conn, fetchSize: s.fetchSize, txHandle: txHandle, txState: &transactionState{}}
 	x, err := work(&tx)
 	if err != nil {
 		// If the client returns a client specific error that means that
@@ -510,14 +519,12 @@ func (s *sessionWithContext) getServers(mode idb.AccessMode) func() []string {
 	}
 }
 
-func (s *sessionWithContext) getConnection(ctx context.Context, mode idb.AccessMode, livenessCheckThreshold time.Duration) (idb.Connection, error) {
+func (s *sessionWithContext) getConnection(ctx context.Context, mode idb.AccessMode, livenessCheckTimeout time.Duration) (idb.Connection, error) {
 	timeout := s.driverConfig.ConnectionAcquisitionTimeout
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		if cancel != nil {
-			defer cancel()
-		}
+		defer cancel()
 		deadline, _ := ctx.Deadline()
 		s.log.Debugf(log.Session, s.logId, "connection acquisition timeout is %s, resolved deadline is: %s", timeout, deadline)
 	} else if deadline, ok := ctx.Deadline(); ok {
@@ -537,7 +544,7 @@ func (s *sessionWithContext) getConnection(ctx context.Context, mode idb.AccessM
 		s.getServers(mode),
 		timeout != 0,
 		s.config.BoltLogger,
-		livenessCheckThreshold,
+		livenessCheckTimeout,
 		s.auth)
 	if err != nil {
 		return nil, errorutil.WrapError(err)
@@ -591,9 +598,13 @@ func (s *sessionWithContext) Run(ctx context.Context,
 		return nil, err
 	}
 
-	conn, err := s.getConnection(ctx, s.defaultMode, pool.DefaultLivenessCheckThreshold)
+	conn, err := s.getConnection(ctx, s.defaultMode, s.driverConfig.ConnectionLivenessCheckTimeout)
 	if err != nil {
 		return nil, errorutil.WrapError(err)
+	}
+
+	if !s.driverConfig.TelemetryDisabled {
+		conn.Telemetry(telemetry.AutoCommitTransaction, nil)
 	}
 
 	runBookmarks, err := s.getBookmarks(ctx)
@@ -627,7 +638,7 @@ func (s *sessionWithContext) Run(ctx context.Context,
 
 	s.autocommitTx = &autocommitTransaction{
 		conn: conn,
-		res: newResultWithContext(conn, stream, cypher, params, func() {
+		res: newResultWithContext(conn, stream, cypher, params, &transactionState{}, func() {
 			if err := s.retrieveBookmarks(ctx, conn, runBookmarks); err != nil {
 				s.log.Warnf(log.Session, s.logId, "could not retrieve bookmarks after result consumption: %s\n"+
 					"the result of the initiating auto-commit transaction may not be visible to subsequent operations", err.Error())
@@ -771,10 +782,10 @@ func (s *erroredSessionWithContext) ExecuteRead(context.Context, ManagedTransact
 func (s *erroredSessionWithContext) ExecuteWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) pipelinedRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSessionWithContext) executeQueryRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) pipelinedWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSessionWithContext) executeQueryWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
 func (s *erroredSessionWithContext) Run(context.Context, string, map[string]any, ...func(*TransactionConfig)) (ResultWithContext, error) {

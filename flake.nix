@@ -7,12 +7,12 @@
   description = "gitlab-ci-crawler, building a dependency graph for CI includes";
 
   outputs = { self, nixpkgs, flake-utils }:
-  flake-utils.lib.eachDefaultSystem (system:
+  flake-utils.lib.eachSystem [ "x86_64-linux" "i686-linux" ] (system:
     let
       pkgs = nixpkgs.legacyPackages.${system};
       build = pkgs.buildGoModule {
         pname = "gitalb-ci-crawler";
-        version = "v0.13.14";
+        version = "v0.13.15";
         modSha256 = pkgs.lib.fakeSha256;
         vendorSha256 = null;
         src = ./.;

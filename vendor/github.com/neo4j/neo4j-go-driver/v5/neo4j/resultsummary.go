@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -266,6 +264,8 @@ const (
 	Performance     NotificationCategory = "PERFORMANCE"
 	Deprecation     NotificationCategory = "DEPRECATION"
 	Generic         NotificationCategory = "GENERIC"
+	Security        NotificationCategory = "SECURITY"
+	Topology        NotificationCategory = "TOPOLOGY"
 	UnknownCategory NotificationCategory = "UNKNOWN"
 )
 
@@ -565,6 +565,10 @@ func (n *notification) Category() NotificationCategory {
 		return Performance
 	case "DEPRECATION":
 		return Deprecation
+	case "SECURITY":
+		return Security
+	case "TOPOLOGY":
+		return Topology
 	case "GENERIC":
 		return Generic
 	default:

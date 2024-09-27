@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -27,6 +25,8 @@ import (
 	iauth "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/auth"
 	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/telemetry"
+	itime "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/time"
 	"net"
 	"reflect"
 	"time"
@@ -96,18 +96,16 @@ type bolt3 struct {
 	authManager   auth.TokenManager
 	resetAuth     bool
 	errorListener ConnectionErrorListener
-	now           *func() time.Time
 }
 
 func NewBolt3(
 	serverName string,
 	conn net.Conn,
 	errorListener ConnectionErrorListener,
-	timer *func() time.Time,
 	logger log.Logger,
 	boltLog log.BoltLogger,
 ) *bolt3 {
-	now := (*timer)()
+	now := itime.Now()
 	b := &bolt3{
 		state:      bolt3_unauthorized,
 		conn:       conn,
@@ -124,7 +122,6 @@ func NewBolt3(
 		idleDate:      now,
 		log:           logger,
 		errorListener: errorListener,
-		now:           timer,
 	}
 	b.out = &outgoing{
 		chunker: newChunker(),
@@ -167,7 +164,7 @@ func (b *bolt3) receiveMsg(ctx context.Context) any {
 		b.state = bolt3_dead
 		return nil
 	}
-	b.idleDate = (*b.now)()
+	b.idleDate = itime.Now()
 	return msg
 }
 
@@ -868,4 +865,8 @@ func (b *bolt3) ResetAuth() {
 func (b *bolt3) GetCurrentAuth() (auth.TokenManager, iauth.Token) {
 	token := iauth.Token{Tokens: b.auth}
 	return b.authManager, token
+}
+
+func (b *bolt3) Telemetry(telemetry.API, func()) {
+	// TELEMETRY not support by this protocol version, so we ignore it.
 }

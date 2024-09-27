@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -24,14 +22,14 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/config"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"io"
 	"net"
 	"time"
 
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/config"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/bolt"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 )
 
@@ -43,7 +41,6 @@ type Connector struct {
 	Network          string
 	Config           *config.Config
 	SupplyConnection func(context.Context, string) (net.Conn, error)
-	Now              *func() time.Time
 }
 
 func (c Connector) Connect(
@@ -89,7 +86,6 @@ func (c Connector) Connect(
 			c.Log,
 			boltLogger,
 			notificationConfig,
-			c.Now,
 		)
 		if err != nil {
 			return nil, err
@@ -124,7 +120,6 @@ func (c Connector) Connect(
 		c.Log,
 		boltLogger,
 		notificationConfig,
-		c.Now,
 	)
 	if err != nil {
 		return nil, err

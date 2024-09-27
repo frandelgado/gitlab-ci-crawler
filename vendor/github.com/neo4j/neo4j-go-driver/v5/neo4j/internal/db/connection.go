@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -25,6 +23,7 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/auth"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db"
 	iauth "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/auth"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/telemetry"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/notifications"
 	"math"
@@ -165,6 +164,8 @@ type Connection interface {
 	ResetAuth()
 	// GetCurrentAuth returns the current authentication manager and token that this connection is authenticated with
 	GetCurrentAuth() (auth.TokenManager, iauth.Token)
+	// Telemetry sends telemetry information about the API usage to the server.
+	Telemetry(api telemetry.API, onSuccess func())
 }
 
 type RoutingTable struct {

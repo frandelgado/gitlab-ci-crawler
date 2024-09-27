@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -21,12 +19,14 @@ package auth
 
 import (
 	"context"
+	"reflect"
+	"time"
+
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/auth"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/racing"
-	"reflect"
-	"time"
+	itime "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/time"
 )
 
 // TokenManager is an interface for components that can provide auth tokens.
@@ -38,9 +38,6 @@ import (
 //
 //	The manager *must not* interact with the driver in any way as this can cause deadlocks and undefined behaviour.
 //	Furthermore, the manager is expected to be thread-safe.
-//
-// TokenManager is part of the re-authentication preview feature
-// (see README on what it means in terms of support and compatibility guarantees)
 type TokenManager interface {
 	// GetAuthToken retrieves an auth.Token or returns an error if the retrieval fails.
 	// auth.Token can be created with built-in functions such as:
@@ -68,7 +65,6 @@ type neo4jAuthTokenManager struct {
 	token                *auth.Token
 	expiration           *time.Time
 	mutex                racing.Mutex
-	now                  *func() time.Time
 	handledSecurityCodes collections.Set[string]
 }
 
@@ -78,7 +74,7 @@ func (m *neo4jAuthTokenManager) GetAuthToken(ctx context.Context) (auth.Token, e
 			"could not acquire lock in time when getting token in neo4jAuthTokenManager")
 	}
 	defer m.mutex.Unlock()
-	if m.token == nil || m.expiration != nil && (*m.now)().After(*m.expiration) {
+	if m.token == nil || m.expiration != nil && itime.Now().After(*m.expiration) {
 		token, expiration, err := m.provider(ctx)
 		if err != nil {
 			return auth.Token{}, err
@@ -115,15 +111,10 @@ func (m *neo4jAuthTokenManager) HandleSecurityException(ctx context.Context, tok
 //
 // The provider function must only ever return auth information belonging to the same identity.
 // Switching identities is undefined behavior.
-//
-// BasicTokenManager is part of the re-authentication preview feature
-// (see README on what it means in terms of support and compatibility guarantees)
 func BasicTokenManager(provider authTokenProvider) TokenManager {
-	now := time.Now
 	return &neo4jAuthTokenManager{
 		provider: wrapWithNilExpiration(provider),
 		mutex:    racing.NewMutex(),
-		now:      &now,
 		handledSecurityCodes: collections.NewSet([]string{
 			"Neo.ClientError.Security.Unauthorized",
 		}),
@@ -142,15 +133,10 @@ func BasicTokenManager(provider authTokenProvider) TokenManager {
 //
 // The provider function must only ever return auth information belonging to the same identity.
 // Switching identities is undefined behavior.
-//
-// BearerTokenManager is part of the re-authentication preview feature
-// (see README on what it means in terms of support and compatibility guarantees)
 func BearerTokenManager(provider authTokenWithExpirationProvider) TokenManager {
-	now := time.Now
 	return &neo4jAuthTokenManager{
 		provider: provider,
 		mutex:    racing.NewMutex(),
-		now:      &now,
 		handledSecurityCodes: collections.NewSet([]string{
 			"Neo.ClientError.Security.TokenExpired",
 			"Neo.ClientError.Security.Unauthorized",

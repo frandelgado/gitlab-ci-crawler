@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -128,6 +126,11 @@ func (q *messageQueue) appendReset(handler responseHandler) {
 func (q *messageQueue) appendGoodbye() {
 	q.out.appendGoodbye()
 	// no response expected here
+}
+
+func (q *messageQueue) appendTelemetry(api int, handler responseHandler) {
+	q.out.appendTelemetry(api)
+	q.enqueueCallback(handler)
 }
 
 func (q *messageQueue) send(ctx context.Context) {

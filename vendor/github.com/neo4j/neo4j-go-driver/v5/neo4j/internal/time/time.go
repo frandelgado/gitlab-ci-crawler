@@ -1,10 +1,8 @@
-//go:build internal_testkit
+//go:build !internal_time_mock
 
 /*
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
- *
- * This file is part of Neo4j.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,19 +17,9 @@
  * limitations under the License.
  */
 
-package auth
+package time
 
 import "time"
 
-func SetTimer(t TokenManager, timer func() time.Time) {
-	if t, ok := t.(*neo4jAuthTokenManager); ok {
-		t.now = &timer
-	}
-}
-
-func ResetTime(t TokenManager) {
-	if t, ok := t.(*neo4jAuthTokenManager); ok {
-		now := time.Now
-		t.now = &now
-	}
-}
+var Now = time.Now
+var Since = time.Since

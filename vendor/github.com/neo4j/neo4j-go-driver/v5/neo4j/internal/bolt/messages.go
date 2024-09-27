@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -40,4 +38,5 @@ const (
 	msgCommit     byte = 0x12
 	msgRollback   byte = 0x13
 	msgRoute      byte = 0x66 // > 4.2
+	msgTelemetry  byte = 0x54
 )

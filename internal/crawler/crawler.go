@@ -4,15 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"strings"
-	"sync"
-
 	"github.com/catouc/gitlab-ci-crawler/internal/gitlab"
 	"github.com/catouc/gitlab-ci-crawler/internal/storage"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
+	"net/http"
+	"strings"
 )
 
 const gitlabCIFileName = ".gitlab-ci.yml"
@@ -22,9 +21,7 @@ type Crawler struct {
 	gitlabClient *gitlab.Client
 	storage      storage.Storage
 	logger       zerolog.Logger
-
-	projectSetMut sync.RWMutex
-	projectSet    map[string]struct{}
+	nWorkers     int
 }
 
 // New creates a new project crawler
@@ -50,7 +47,7 @@ func New(cfg *Config, logger zerolog.Logger, store storage.Storage) (*Crawler, e
 		gitlabClient: gitlabClient,
 		storage:      store,
 		logger:       logger,
-		projectSet:   make(map[string]struct{}),
+		nWorkers:     cfg.NumberOfWorkers,
 	}, nil
 }
 
@@ -81,18 +78,18 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 		streamOK = true
 	}()
 
-	for p := range resultChan {
-		_, exists := c.projectSet[p.PathWithNamespace]
-		if exists {
-			continue
-		}
+	errs, ctx := errgroup.WithContext(ctx)
 
-		if err := c.updateProjectInGraph(ctx, p); err != nil {
-			c.logger.Err(err).
-				Str("ProjectPath", p.PathWithNamespace).
-				Int("ProjectID", p.ID).
-				Msg("failed to parse project")
-		}
+	for i := 0; i < c.nWorkers; i++ {
+		errs.Go(
+			func() error {
+				err := c.updateProjectInGraphWorker(ctx, resultChan)
+				return err
+			})
+	}
+	err := errs.Wait()
+	if err != nil {
+		return err
 	}
 
 	if !streamOK {
@@ -103,22 +100,24 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 	return nil
 }
 
+func (c *Crawler) updateProjectInGraphWorker(ctx context.Context, projects chan gitlab.Project) error {
+	for p := range projects {
+		if err := c.updateProjectInGraph(ctx, p); err != nil {
+			c.logger.Err(err).
+				Str("ProjectPath", p.PathWithNamespace).
+				Int("ProjectID", p.ID).
+				Msg("failed to parse project")
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Project) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		c.projectSetMut.RLock()
-		_, exists := c.projectSet[project.PathWithNamespace]
-		if exists {
-			c.projectSetMut.RUnlock()
-			return nil
-		}
-		c.projectSetMut.RUnlock()
-		c.projectSetMut.Lock()
-		c.projectSet[project.PathWithNamespace] = struct{}{}
-		c.projectSetMut.Unlock()
-
 		if err := c.storage.CreateProjectNode(ctx, project.PathWithNamespace); err != nil {
 			return fmt.Errorf("failed to write project to neo4j: %w", err)
 		}
@@ -131,7 +130,7 @@ func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Proje
 			return nil
 		}
 
-		err := c.handleIncludes(ctx, project, gitlabCIFileName)
+		err := c.handleIncludes(ctx, project, gitlabCIFileName, make(map[string]bool))
 		if err != nil {
 			c.logger.Error().
 				Err(err).
@@ -142,7 +141,16 @@ func (c *Crawler) updateProjectInGraph(ctx context.Context, project gitlab.Proje
 	}
 }
 
-func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, filePath string) error {
+func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, filePath string, cycleDetectionMap map[string]bool) error {
+	if cycleDetectionMap[project.PathWithNamespace + "--" + filePath] {
+		projectsVisited := make([]string, 0, len(cycleDetectionMap))
+		for k := range cycleDetectionMap {
+			projectsVisited = append(projectsVisited, k)
+		}
+		return errors.New("cycle detected, this should not be possible, the projects visited are: " + strings.Join(projectsVisited[:], ","))
+	}
+	cycleDetectionMap[project.PathWithNamespace + "--" + filePath] = true
+
 	gitlabCIFile, err := c.gitlabClient.GetRawFileFromProject(ctx, project.ID, filePath, project.DefaultBranch)
 	if err != nil {
 		if errors.Is(err, gitlab.ErrRawFileNotFound) {
@@ -151,12 +159,41 @@ func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, fi
 		return fmt.Errorf("failed to get file %s: %w", filePath, err)
 	}
 
+	triggers, err := c.parseTriggers(gitlabCIFile)
+	if err != nil {
+		return fmt.Errorf("failed to parse triggers: %w", err)
+	}
+
+	triggers = c.enrichTriggers(triggers, project.PathWithNamespace)
+
+	for _, trigger := range triggers {
+		c.logger.Debug().Dict("trigger", zerolog.Dict().
+			Str("Project", trigger.Project).
+			Str("SourceProject", project.PathWithNamespace),
+		).Msg("")
+		err := c.storage.CreateTriggerEdge(ctx, storage.Edge{
+			SourceProject: project.PathWithNamespace,
+			TargetProject: trigger.Project,
+			Ref: trigger.Branch,
+		})
+		if err != nil {
+			c.logger.Err(err).
+				Str("Project", project.PathWithNamespace).
+				Msg("failed to create trigger edge")
+		}
+	}
+
 	includes, err := c.parseIncludes(gitlabCIFile)
 	if err != nil {
 		return fmt.Errorf("failed to parse includes: %w", err)
 	}
 
-	includes = c.enrichIncludes(includes, project, c.config.DefaultRefName)
+	includes = c.enrichIncludes(
+		includes,
+		project.DefaultBranch,
+		project.PathWithNamespace,
+		c.config.DefaultRefName,
+	)
 
 	for _, i := range includes {
 		if i.Ref == "" {
@@ -178,7 +215,7 @@ func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, fi
 		}
 
 		for _, f := range i.Files {
-			err = c.handleIncludes(ctx, p, f)
+			err = c.handleIncludes(ctx, p, f, cycleDetectionMap)
 			if err != nil {
 				return err
 			}
@@ -189,27 +226,18 @@ func (c *Crawler) handleIncludes(ctx context.Context, project gitlab.Project, fi
 }
 
 func (c *Crawler) traverseIncludes(ctx context.Context, parentName string, include RemoteInclude) error {
-	c.projectSetMut.Lock()
-	c.projectSet[include.Project] = struct{}{}
-	c.projectSetMut.Unlock()
 
 	if err := c.storage.CreateProjectNode(ctx, include.Project); err != nil {
 		return fmt.Errorf("failed to write project to neo4j: %w", err)
 	}
 
-	if err := c.storage.CreateIncludeEdge(ctx, storage.IncludeEdge{
+	if err := c.storage.CreateIncludeEdge(ctx, storage.Edge{
 		SourceProject: parentName,
 		TargetProject: include.Project,
 		Ref:           include.Ref,
 		Files:         include.Files,
 	}); err != nil {
 		return fmt.Errorf("failed to write neo4j transaction: %w", err)
-	}
-
-	for _, ci := range include.Children {
-		if err := c.traverseIncludes(ctx, ci.Project, ci); err != nil {
-			return fmt.Errorf("failed to write child includes for %s: %w", ci.Project, err)
-		}
 	}
 
 	return nil

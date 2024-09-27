@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -21,9 +19,10 @@ package router
 
 import (
 	"context"
+	"time"
+
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/pool"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 )
 
@@ -34,6 +33,7 @@ func readTable(
 	connectionPool Pool,
 	routers []string,
 	routerContext map[string]string,
+	idlenessTimeout time.Duration,
 	bookmarks []string,
 	database,
 	impersonatedUser string,
@@ -48,7 +48,7 @@ func readTable(
 	// another db.
 	for _, router := range routers {
 		var conn db.Connection
-		if conn, err = connectionPool.Borrow(ctx, getStaticServer(router), true, boltLogger, pool.DefaultLivenessCheckThreshold, auth); err != nil {
+		if conn, err = connectionPool.Borrow(ctx, getStaticServer(router), true, boltLogger, idlenessTimeout, auth); err != nil {
 			// Check if failed due to context timing out
 			if ctx.Err() != nil {
 				return nil, wrapError(router, ctx.Err())

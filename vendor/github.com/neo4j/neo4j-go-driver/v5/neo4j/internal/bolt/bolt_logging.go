@@ -1,3 +1,20 @@
+/*
+ * Copyright (c) "Neo4j"
+ * Neo4j Sweden AB [https://neo4j.com]
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package bolt
 
 import (
@@ -8,26 +25,27 @@ import (
 
 type loggableDictionary map[string]any
 
-func (d loggableDictionary) String() string {
-	if credentials, ok := d["credentials"]; ok {
-		d["credentials"] = "<redacted>"
-		defer func() {
-			d["credentials"] = credentials
-		}()
+func copyAndSanitizeDictionary[T any | string](in map[string]T) map[string]T {
+	out := make(map[string]T, len(in))
+	for k, v := range in {
+		if k == "credentials" {
+			var redacted any = "<redacted>"
+			out[k] = redacted.(T)
+		} else {
+			out[k] = v
+		}
 	}
-	return serializeTrace(d)
+	return out
+}
+
+func (d loggableDictionary) String() string {
+	return serializeTrace(copyAndSanitizeDictionary(d))
 }
 
 type loggableStringDictionary map[string]string
 
 func (sd loggableStringDictionary) String() string {
-	if credentials, ok := sd["credentials"]; ok {
-		sd["credentials"] = "<redacted>"
-		defer func() {
-			sd["credentials"] = credentials
-		}()
-	}
-	return serializeTrace(sd)
+	return serializeTrace(copyAndSanitizeDictionary(sd))
 }
 
 type loggableList []any

@@ -1,10 +1,10 @@
 package crawler
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/catouc/gitlab-ci-crawler/internal/gitlab"
 	"github.com/rs/zerolog"
 	"gopkg.in/yaml.v3"
 )
@@ -16,7 +16,6 @@ type RemoteInclude struct {
 	Local    string      `yaml:"local"`
 	Remote   string      `yaml:"remote"`
 	Template string      `yaml:"template"`
-	Children []RemoteInclude
 }
 
 type StringArray []string
@@ -37,12 +36,21 @@ func (a *StringArray) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-func (c *Crawler) parseIncludes(file []byte) ([]RemoteInclude, error) {
+func (c *Crawler) UnmarshalCIFile(file []byte) (map[string]interface{}, error) {
 	var parsed map[string]interface{}
 
 	err := yaml.Unmarshal(file, &parsed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal includes: %s", err)
+		return nil, fmt.Errorf("failed to unmarshal ci file: %s", err)
+	}
+
+	return parsed, nil
+}
+
+func (c *Crawler) parseIncludes(file []byte) ([]RemoteInclude, error) {
+	parsed, err := c.UnmarshalCIFile(file)
+	if err != nil {
+		return nil, err
 	}
 
 	rawIncludes, exist := parsed["include"]
@@ -170,7 +178,7 @@ func (c *Crawler) parseIncludeMap(input map[string]interface{}) (RemoteInclude, 
 	}, nil
 }
 
-func (c *Crawler) enrichIncludes(rawIncludes []RemoteInclude, project gitlab.Project, defaultRefName string) []RemoteInclude {
+func (c *Crawler) enrichIncludes(rawIncludes []RemoteInclude, defaultBranch, projectPathWithNamespace, defaultRefName string) []RemoteInclude {
 	enrichedIncludes := make([]RemoteInclude, len(rawIncludes))
 
 	for i, include := range rawIncludes {
@@ -188,14 +196,14 @@ func (c *Crawler) enrichIncludes(rawIncludes []RemoteInclude, project gitlab.Pro
 				include.Ref = defaultRefName
 			}
 		case include.Local != "":
-			include.Project = project.PathWithNamespace
-			include.Ref = project.DefaultBranch
+			include.Project = projectPathWithNamespace
+			include.Ref = defaultBranch 
 			include.Files = []string{include.Local}
 		case include.Remote != "":
 			// TODO: implement
 		case include.Template != "":
-			include.Project = project.PathWithNamespace
-			include.Ref = project.DefaultBranch
+			include.Project = projectPathWithNamespace
+			include.Ref = defaultBranch
 			include.Files = []string{include.Template}
 		default:
 			c.logger.Warn().
@@ -210,4 +218,95 @@ func (c *Crawler) enrichIncludes(rawIncludes []RemoteInclude, project gitlab.Pro
 		enrichedIncludes[i] = include
 	}
 	return enrichedIncludes
+}
+
+type RawTrigger struct {
+	Include string `yaml:"include"`
+	Project string `yaml:"project"`
+	Branch  string `yaml:"branch"`
+}
+
+func (c *Crawler) parseTriggers(file []byte) ([]RawTrigger, error) {
+	parsed, err := c.UnmarshalCIFile(file)
+	if err != nil {
+		return nil, err
+	}
+
+	triggers := make([]RawTrigger, 0)
+	for rawJob := range parsed {
+		job, isMap := parsed[rawJob].(map[string]interface{})
+		if !isMap {
+			c.logger.Debug().
+				Str("CIFileKey", rawJob).
+				Msg("Skipping job since it's not a map")
+			continue
+		}
+
+		rawTrigger, triggerExists := job["trigger"]
+		if !triggerExists {
+			c.logger.Debug().
+				Str("CIFileKey", rawJob).
+				Msg("Skipping job since it doesn't contain a trigger")
+		}
+
+		switch t := rawTrigger.(type) {
+		case string:
+			triggers = append(triggers, RawTrigger{Project: t})
+		case map[string]interface{}:
+			println(t["include"])
+			trigger, err := c.parseTriggerMap(t)
+			if err != nil {
+				c.logger.Warn().
+					Err(err).
+					Str("CIFileKey", rawJob).
+					Msg("could not parse contents of trigger")
+			}
+			triggers = append(triggers, trigger)
+		}
+	}
+
+	return triggers, nil
+}
+
+func (c *Crawler) parseTriggerMap(input map[string]interface{}) (RawTrigger, error) {
+	t := RawTrigger{
+		Include: extractFieldFromMap("include", input),
+		Project: extractFieldFromMap("project", input),
+		Branch:  extractFieldFromMap("branch", input),
+	}
+
+	if t.Include == "" && t.Project == "" && t.Branch == "" {
+		return RawTrigger{}, errors.New("trigger map is not parseable")
+	}
+
+	return t, nil
+}
+
+func extractFieldFromMap(fieldName string, in map[string]interface{}) string {
+	field, exists := in[fieldName]
+	if !exists {
+		return ""
+	}
+
+	sField, ok := field.(string)
+	if !ok {
+		return ""
+	}
+
+	return sField
+}
+
+func (c *Crawler) enrichTriggers(triggers []RawTrigger, projectPathWithNameSpace string) []RawTrigger {
+	enrichedTriggers := make([]RawTrigger, 0)
+	for _, t := range triggers {
+		if t.Branch == "" {
+			t.Branch = c.config.DefaultRefName
+		}
+
+		if t.Include != "" && t.Project == "" {
+			t.Project = projectPathWithNameSpace	
+		}
+		enrichedTriggers = append(enrichedTriggers, t)
+	}
+	return enrichedTriggers
 }

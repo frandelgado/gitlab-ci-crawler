@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -23,12 +21,11 @@ package bolt
 import (
 	"context"
 	"fmt"
+	"net"
+
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/racing"
-	"net"
-	"time"
-
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 )
 
@@ -40,7 +37,7 @@ type protocolVersion struct {
 
 // Supported versions in priority order
 var versions = [4]protocolVersion{
-	{major: 5, minor: 3, back: 3},
+	{major: 5, minor: 4, back: 4},
 	{major: 4, minor: 4, back: 2},
 	{major: 4, minor: 1},
 	{major: 3, minor: 0},
@@ -58,7 +55,7 @@ func Connect(ctx context.Context,
 	logger log.Logger,
 	boltLogger log.BoltLogger,
 	notificationConfig db.NotificationConfig,
-	timer *func() time.Time) (db.Connection, error) {
+) (db.Connection, error) {
 	// Perform Bolt handshake to negotiate version
 	// Send handshake to server
 	handshake := []byte{
@@ -95,11 +92,11 @@ func Connect(ctx context.Context,
 	var boltConn db.Connection
 	switch major {
 	case 3:
-		boltConn = NewBolt3(serverName, conn, errorListener, timer, logger, boltLogger)
+		boltConn = NewBolt3(serverName, conn, errorListener, logger, boltLogger)
 	case 4:
-		boltConn = NewBolt4(serverName, conn, errorListener, timer, logger, boltLogger)
+		boltConn = NewBolt4(serverName, conn, errorListener, logger, boltLogger)
 	case 5:
-		boltConn = NewBolt5(serverName, conn, errorListener, timer, logger, boltLogger)
+		boltConn = NewBolt5(serverName, conn, errorListener, logger, boltLogger)
 	case 0:
 		return nil, fmt.Errorf("server did not accept any of the requested Bolt versions (%#v)", versions)
 	default:

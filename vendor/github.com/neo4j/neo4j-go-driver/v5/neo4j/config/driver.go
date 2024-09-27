@@ -2,8 +2,6 @@
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
  *
- * This file is part of Neo4j.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -105,6 +103,21 @@ type Config struct {
 	//
 	// default: 1 * time.Minute
 	ConnectionAcquisitionTimeout time.Duration
+	// ConnectionLivenessCheckTimeout sets the timeout duration for idle connections in the pool.
+	// Connections idle longer than this timeout will be tested for liveliness before reuse. A low timeout value
+	// can increase network requests when acquiring a connection, impacting performance. Conversely, a high
+	// timeout may result in using connections that are no longer active, causing exceptions in your application.
+	// These exceptions typically resolve with a retry or using a driver API with automatic
+	// retries, assuming the database is operational.
+	//
+	// The parameter balances the likelihood of encountering connection issues against performance.
+	// Typically, adjustment of this parameter is not necessary.
+	//
+	// By default, no liveliness check is performed. A value of 0 ensures connections are always tested for
+	// validity, and negative values are not permitted.
+	//
+	// default: pool.DefaultConnectionLivenessCheckTimeout
+	ConnectionLivenessCheckTimeout time.Duration
 	// Connect timeout that will be set on underlying sockets. Values less than
 	// or equal to 0 results in no timeout being applied.
 	//
@@ -146,6 +159,22 @@ type Config struct {
 	// By default, the server's settings are used.
 	// Disabling categories allows the server to skip analysis for those, which can speed up query execution.
 	NotificationsDisabledCategories notifications.NotificationDisabledCategories
+	// By default, if the server requests it, the driver will automatically transmit anonymous usage
+	// statistics to the server it is connected to.
+	//
+	// By configuring TelemetryDisabled=True, the driver will refrain from transmitting any telemetry data.
+	//
+	// Each time one of the specified APIs is utilized to execute a query for the first time, the driver
+	// informs the server of this action without providing additional details such as arguments or client identifiers:
+	//
+	//   DriverWithContext.ExecuteQuery
+	//   SessionWithContext.Run
+	//   SessionWithContext.BeginTransaction
+	//   SessionWithContext.ExecuteRead
+	//   SessionWithContext.ExecuteWrite
+	//
+	// default: true
+	TelemetryDisabled bool
 }
 
 // ServerAddressResolver is a function type that defines the resolver function used by the routing driver to

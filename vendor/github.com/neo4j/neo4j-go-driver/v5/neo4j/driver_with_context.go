@@ -1,8 +1,8 @@
+// Package neo4j provides required functionality to connect and execute statements against a Neo4j Database.
+
 /*
  * Copyright (c) "Neo4j"
  * Neo4j Sweden AB [https://neo4j.com]
- *
- * This file is part of Neo4j.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,25 +17,22 @@
  * limitations under the License.
  */
 
-// Package neo4j provides required functionality to connect and execute statements against a Neo4j Database.
 package neo4j
 
 import (
 	"context"
 	"fmt"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/auth"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/connector"
 	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/pool"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/racing"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/router"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/log"
 	"net/url"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/connector"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/pool"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/router"
 )
 
 // AccessMode defines modes that routing driver decides to which cluster member
@@ -85,9 +82,6 @@ type DriverWithContext interface {
 	// Otherwise, the error will be matched against a list of known authentication errors.
 	// If the error is on that list, an `neo4j.InvalidAuthenticationError` is returned.
 	// Otherwise, the original error is returned.
-	//
-	// VerifyAuthentication is part of the re-authentication preview feature
-	// (see README on what it means in terms of support and compatibility guarantees)
 	VerifyAuthentication(ctx context.Context, auth *AuthToken) error
 	// Close the driver and all underlying connections
 	Close(ctx context.Context) error
@@ -144,18 +138,13 @@ type ResultTransformer[T any] interface {
 //   - `neo4j.KerberosAuth`
 //   - `neo4j.BearerAuth`
 //   - `neo4j.CustomAuth`
-//
-// `TokenManager` is part of the re-authentication preview feature
-// (see README on what it means in terms of support and compatibility guarantees).
-// The pre-defined auth mechanisms listed above however are guaranteed to be supported
-// as `auth` argument to this function.
 func NewDriverWithContext(target string, auth auth.TokenManager, configurers ...func(*Config)) (DriverWithContext, error) {
 	parsed, err := url.Parse(target)
 	if err != nil {
 		return nil, err
 	}
 
-	d := driverWithContext{target: parsed, mut: racing.NewMutex(), now: time.Now, auth: auth}
+	d := driverWithContext{target: parsed, mut: racing.NewMutex(), auth: auth}
 
 	routing := true
 	d.connector.Network = "tcp"
@@ -230,10 +219,9 @@ func NewDriverWithContext(target string, auth auth.TokenManager, configurers ...
 	d.connector.Log = d.log
 	d.connector.RoutingContext = routingContext
 	d.connector.Config = d.config
-	d.connector.Now = &d.now
 
 	// Let the pool use the same log ID as the driver to simplify log reading.
-	d.pool = pool.New(d.config, d.connector.Connect, d.log, d.logId, &d.now)
+	d.pool = pool.New(d.config, d.connector.Connect, d.log, d.logId)
 
 	if !routing {
 		d.router = &directRouter{address: address}
@@ -251,7 +239,15 @@ func NewDriverWithContext(target string, auth auth.TokenManager, configurers ...
 			}
 		}
 		// Let the router use the same log ID as the driver to simplify log reading.
-		d.router = router.New(address, routersResolver, routingContext, d.pool, d.log, d.logId, &d.now)
+		d.router = router.New(
+			address,
+			routersResolver,
+			routingContext,
+			d.pool,
+			d.config.ConnectionLivenessCheckTimeout,
+			d.log,
+			d.logId,
+		)
 	}
 
 	d.pool.SetRouter(d.router)
@@ -334,7 +330,6 @@ type driverWithContext struct {
 	// this is *not* used by default by user-created session (see NewSession)
 	executeQueryBookmarkManager BookmarkManager
 	auth                        auth.TokenManager
-	now                         func() time.Time
 }
 
 func (d *driverWithContext) Target() url.URL {
@@ -370,7 +365,7 @@ func (d *driverWithContext) NewSession(ctx context.Context, config SessionConfig
 		return &erroredSessionWithContext{
 			err: &UsageError{Message: "Trying to create session on closed driver"}}
 	}
-	return newSessionWithContext(d.config, config, d.router, d.pool, d.log, reAuthToken, &d.now)
+	return newSessionWithContext(d.config, config, d.router, d.pool, d.log, reAuthToken)
 }
 
 func (d *driverWithContext) VerifyConnectivity(ctx context.Context) error {
@@ -545,7 +540,7 @@ func ExecuteQuery[T any](
 	if err != nil {
 		return *new(T), err
 	}
-	result, err := txFunction(ctx, executeQueryCallback(ctx, query, parameters, newResultTransformer))
+	result, err := txFunction(ctx, executeQueryCallback(ctx, query, parameters, newResultTransformer), configuration.TransactionConfigurers...)
 	if err != nil {
 		return *new(T), err
 	}
@@ -670,13 +665,21 @@ func ExecuteQueryWithBoltLogger(boltLogger log.BoltLogger) ExecuteQueryConfigura
 	}
 }
 
+// ExecuteQueryWithTransactionConfig configures DriverWithContext.ExecuteQuery with additional transaction configuration.
+func ExecuteQueryWithTransactionConfig(configurers ...func(*TransactionConfig)) ExecuteQueryConfigurationOption {
+	return func(configuration *ExecuteQueryConfiguration) {
+		configuration.TransactionConfigurers = configurers
+	}
+}
+
 // ExecuteQueryConfiguration holds all the possible configuration settings for DriverWithContext.ExecuteQuery
 type ExecuteQueryConfiguration struct {
-	Routing          RoutingControl
-	ImpersonatedUser string
-	Database         string
-	BookmarkManager  BookmarkManager
-	BoltLogger       log.BoltLogger
+	Routing                RoutingControl
+	ImpersonatedUser       string
+	Database               string
+	BookmarkManager        BookmarkManager
+	BoltLogger             log.BoltLogger
+	TransactionConfigurers []func(*TransactionConfig)
 }
 
 // RoutingControl specifies how the query executed by DriverWithContext.ExecuteQuery is to be routed
@@ -685,7 +688,7 @@ type RoutingControl int
 const (
 	// Write routes the query to execute to a writer member of the cluster
 	Write RoutingControl = iota
-	// Read routes the query to execute to a writer member of the cluster
+	// Read routes the query to execute to a reader member of the cluster
 	Read
 )
 
@@ -703,9 +706,9 @@ type transactionFunction func(context.Context, ManagedTransactionWork, ...func(*
 func (c *ExecuteQueryConfiguration) selectTxFunctionApi(session SessionWithContext) (transactionFunction, error) {
 	switch c.Routing {
 	case Read:
-		return session.pipelinedRead, nil
+		return session.executeQueryRead, nil
 	case Write:
-		return session.pipelinedWrite, nil
+		return session.executeQueryWrite, nil
 	}
 	return nil, fmt.Errorf("unsupported routing control, expected %d (Write) or %d (Read) "+
 		"but got: %d", Write, Read, c.Routing)
